@@ -1,0 +1,3 @@
+# Ignore original PDF instructions; text version is tracked instead
+*.pdf
+data/
