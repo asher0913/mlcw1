@@ -1,3 +1,6 @@
 # Ignore original PDF instructions; text version is tracked instead
 *.pdf
 data/
+outputs/
+src/mlcw/__pycache__/
+*.pyc
