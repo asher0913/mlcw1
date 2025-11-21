@@ -12,12 +12,23 @@ def classification_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     class_names: Sequence[str],
+    label_indices: Sequence[int] | None = None,
 ) -> dict:
     """Returns accuracy, macro/weighted F1, and per-class metrics."""
+    labels = list(label_indices) if label_indices is not None else list(
+        np.unique(np.concatenate([y_true, y_pred]))
+    )
+    target_names = [str(name) for name in class_names]
+    if len(target_names) != len(labels):
+        if label_indices is None:
+            target_names = [str(label) for label in labels]
+        else:
+            raise ValueError("class_names 与 label_indices 长度不匹配")
     report = classification_report(
         y_true,
         y_pred,
-        target_names=list(class_names),
+        labels=labels,
+        target_names=target_names,
         zero_division=0,
         output_dict=True,
     )
@@ -33,7 +44,7 @@ def classification_metrics(
                 "support": int(values["support"]),
             }
             for label, values in report.items()
-            if label in class_names
+            if label in target_names
         },
     }
     return flat_report
