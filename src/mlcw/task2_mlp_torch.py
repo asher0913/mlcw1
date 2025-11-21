@@ -14,11 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset, TensorDataset
+from tqdm.auto import tqdm
 
 from .features import FeatureSet
 from .metrics import classification_metrics
 from .plotting import plot_metric_curve, plot_param_bar
-from .utils import ensure_dir, save_json, get_torch_device
+from .utils import ensure_dir, save_json, get_torch_device, seed_torch
 
 
 def _require_gpu() -> torch.device:
@@ -85,6 +86,7 @@ def _train_one_fold(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     device: torch.device,
+    progress_desc: str | None = None,
 ) -> tuple[float, float]:
     train_loader, val_loader = _make_loaders(X, y, train_idx, val_idx, params.batch_size)
     model = MLPClassifier(
@@ -101,7 +103,13 @@ def _train_one_fold(
     best_state = copy.deepcopy(model.state_dict())
     epochs_no_improve = 0
 
-    for _ in range(params.epochs):
+    epoch_bar = tqdm(
+        range(params.epochs),
+        desc=progress_desc or "MLP Epochs",
+        leave=False,
+        unit="epoch",
+    )
+    for _ in epoch_bar:
         model.train()
         for xb, yb in train_loader:
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
@@ -151,8 +159,9 @@ def _evaluate_test(
     device: torch.device,
     class_names: Sequence[str],
     seed: int,
+    progress_desc: str | None = None,
 ):
-    torch.manual_seed(seed)
+    seed_torch(seed)
     train_loader = DataLoader(
         TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)),
         batch_size=params.batch_size,
@@ -177,7 +186,13 @@ def _evaluate_test(
     best_state = copy.deepcopy(model.state_dict())
     best_acc = 0.0
     epochs_no_improve = 0
-    for _ in range(params.epochs):
+    epoch_bar = tqdm(
+        range(params.epochs),
+        desc=progress_desc or "MLP Full Train",
+        leave=False,
+        unit="epoch",
+    )
+    for _ in epoch_bar:
         model.train()
         for xb, yb in train_loader:
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
@@ -251,15 +266,33 @@ def run_feature_dimension_experiment(
         patience=base_params.get("patience", 10),
     )
 
-    for idx, feat in enumerate(feature_sets):
+    feature_progress = tqdm(
+        enumerate(feature_sets),
+        total=len(feature_sets),
+        desc="Task2: MLP 特征",
+        unit="set",
+    )
+    for idx, feat in feature_progress:
         seed = random_state + idx * 97
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        seed_torch(seed)
         skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
         fold_metrics: List[Dict] = []
+        fold_progress = tqdm(
+            total=cv_splits,
+            desc=f"[Task2][{feat.name}] Folds",
+            leave=False,
+            unit="fold",
+        )
         for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(feat.X_train, y_train), start=1):
             val_acc, val_f1 = _train_one_fold(
-                feat.X_train, y_train, feat.n_features, train_params, tr_idx, val_idx, device
+                feat.X_train,
+                y_train,
+                feat.n_features,
+                train_params,
+                tr_idx,
+                val_idx,
+                device,
+                progress_desc=f"[Task2][{feat.name}] Fold {fold_idx}",
             )
             fold_metrics.append(
                 {
@@ -270,6 +303,8 @@ def run_feature_dimension_experiment(
                     "val_macro_f1": val_f1,
                 }
             )
+            fold_progress.update(1)
+        fold_progress.close()
         cv_rows.extend(fold_metrics)
         mean_val_acc = float(np.mean([r["val_accuracy"] for r in fold_metrics]))
         mean_val_f1 = float(np.mean([r["val_macro_f1"] for r in fold_metrics]))
@@ -283,6 +318,7 @@ def run_feature_dimension_experiment(
             device,
             class_names,
             seed + 999,
+            progress_desc=f"[Task2][{feat.name}] Test Fit",
         )
         test_metrics_json[feat.name] = test_metrics
         save_json(test_metrics, reports_dir / f"{feat.name}_test_metrics.json")
@@ -337,7 +373,13 @@ def run_hparam_experiment(
     labels_plot = []
     values_plot = []
 
-    for idx, cfg in enumerate(hparam_grid):
+    config_progress = tqdm(
+        enumerate(hparam_grid),
+        total=len(hparam_grid),
+        desc="Task2: MLP 超参",
+        unit="cfg",
+    )
+    for idx, cfg in config_progress:
         name = cfg.get("name", f"cfg_{idx}")
         params = TrainParams(
             hidden_sizes=cfg.get("hidden_layer_sizes", base_params.get("hidden_layer_sizes", (512, 256))),
@@ -349,10 +391,15 @@ def run_hparam_experiment(
             patience=cfg.get("patience", base_params.get("patience", 10)),
         )
         seed = random_state + idx * 131
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        seed_torch(seed)
         skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
         fold_metrics: List[Dict] = []
+        fold_progress = tqdm(
+            total=cv_splits,
+            desc=f"[Task2][{name}] Folds",
+            leave=False,
+            unit="fold",
+        )
         for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(feature_set.X_train, y_train), start=1):
             val_acc, val_f1 = _train_one_fold(
                 feature_set.X_train,
@@ -362,6 +409,7 @@ def run_hparam_experiment(
                 tr_idx,
                 val_idx,
                 device,
+                progress_desc=f"[Task2][{name}] Fold {fold_idx}",
             )
             fold_metrics.append(
                 {
@@ -371,6 +419,8 @@ def run_hparam_experiment(
                     "val_macro_f1": val_f1,
                 }
             )
+            fold_progress.update(1)
+        fold_progress.close()
         cv_rows.extend(fold_metrics)
         mean_val_acc = float(np.mean([r["val_accuracy"] for r in fold_metrics]))
         mean_val_f1 = float(np.mean([r["val_macro_f1"] for r in fold_metrics]))
@@ -384,6 +434,7 @@ def run_hparam_experiment(
             device,
             class_names,
             seed + 777,
+            progress_desc=f"[Task2][{name}] Test Fit",
         )
         test_metrics_json[name] = test_metrics
         save_json(test_metrics, reports_dir / f"{name}_test_metrics.json")

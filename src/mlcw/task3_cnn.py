@@ -16,10 +16,11 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
+from tqdm.auto import tqdm
 
 from .metrics import classification_metrics
 from .plotting import plot_param_bar
-from .utils import ensure_dir, save_json, get_torch_device
+from .utils import ensure_dir, save_json, get_torch_device, seed_torch, empty_device_cache
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
@@ -141,6 +142,7 @@ def _train_full_model(
     transform_train,
     params: Dict,
     device: torch.device,
+    progress_desc: str | None = None,
 ) -> nn.Module:
     train_indices = np.arange(len(train_labels))
     train_loader = _build_dataloader(
@@ -161,7 +163,13 @@ def _train_full_model(
         weight_decay=params["weight_decay"],
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=params["epochs"])
-    for _ in range(params["epochs"]):
+    epoch_bar = tqdm(
+        range(params["epochs"]),
+        desc=progress_desc or "CNN Full Train",
+        leave=False,
+        unit="epoch",
+    )
+    for _ in epoch_bar:
         _train_one_epoch(model, train_loader, criterion, optimizer, device)
         scheduler.step()
     return model
@@ -233,18 +241,28 @@ def run_feature_variant_experiment(
     plot_labels: List[str] = []
     plot_values: List[float] = []
 
-    for idx, variant in enumerate(feature_variants):
+    variant_progress = tqdm(
+        enumerate(feature_variants),
+        total=len(feature_variants),
+        desc="Task3: CNN 增广",
+        unit="variant",
+    )
+    for idx, variant in variant_progress:
         seed = random_state + idx * 503
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        seed_torch(seed)
         transformer_train = variant["train_transform"]
         transformer_eval = variant["eval_transform"]
 
         skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
         fold_metrics: List[Dict] = []
+        fold_progress = tqdm(
+            total=cv_splits,
+            desc=f"[Task3][{variant['name']}] Folds",
+            leave=False,
+            unit="fold",
+        )
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(train_images, train_labels), start=1):
-            torch.manual_seed(seed + fold_idx)
-            torch.cuda.manual_seed_all(seed + fold_idx)
+            seed_torch(seed + fold_idx)
             train_loader = _build_dataloader(
                 train_images,
                 train_labels,
@@ -277,7 +295,13 @@ def run_feature_variant_experiment(
             best_state = copy.deepcopy(model.state_dict())
             best_acc = 0.0
             best_macro_f1 = 0.0
-            for _ in range(base_params["epochs"]):
+            epoch_bar = tqdm(
+                range(base_params["epochs"]),
+                desc=f"[Task3][{variant['name']}][Fold {fold_idx}]",
+                leave=False,
+                unit="epoch",
+            )
+            for _ in epoch_bar:
                 _train_one_epoch(model, train_loader, criterion, optimizer, device)
                 _, val_acc, val_macro_f1 = _evaluate(model, val_loader, criterion, device)
                 if val_acc > best_acc:
@@ -294,7 +318,9 @@ def run_feature_variant_experiment(
                 }
             )
             del model
-            torch.cuda.empty_cache()
+            empty_device_cache()
+            fold_progress.update(1)
+        fold_progress.close()
 
         cv_rows.extend(fold_metrics)
         mean_val_acc = float(np.mean([row["val_accuracy"] for row in fold_metrics]))
@@ -306,6 +332,7 @@ def run_feature_variant_experiment(
             transformer_train,
             base_params,
             device,
+            progress_desc=f"[Task3][{variant['name']}] Test Fit",
         )
         test_loader = _build_dataloader(
             test_images,
@@ -336,7 +363,7 @@ def run_feature_variant_experiment(
         plot_labels.append(variant["name"])
         plot_values.append(test_metrics["accuracy"])
         del final_model
-        torch.cuda.empty_cache()
+        empty_device_cache()
 
     cv_df = pd.DataFrame(cv_rows)
     summary_df = pd.DataFrame(summary_rows)
@@ -397,17 +424,27 @@ def run_hparam_experiment(
     plot_labels: List[str] = []
     plot_values: List[float] = []
 
-    for idx, config in enumerate(hparam_grid):
+    config_progress = tqdm(
+        enumerate(hparam_grid),
+        total=len(hparam_grid),
+        desc="Task3: CNN 超参",
+        unit="cfg",
+    )
+    for idx, config in config_progress:
         name = config.get("name", f"cnn_config_{idx}")
         params = {**base_params, **{k: v for k, v in config.items() if k != "name"}}
         seed = random_state + idx * 701
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        seed_torch(seed)
         skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
         fold_metrics: List[Dict] = []
+        fold_progress = tqdm(
+            total=cv_splits,
+            desc=f"[Task3][{name}] Folds",
+            leave=False,
+            unit="fold",
+        )
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(train_images, train_labels), start=1):
-            torch.manual_seed(seed + fold_idx)
-            torch.cuda.manual_seed_all(seed + fold_idx)
+            seed_torch(seed + fold_idx)
             train_loader = _build_dataloader(
                 train_images,
                 train_labels,
@@ -440,7 +477,13 @@ def run_hparam_experiment(
             best_state = copy.deepcopy(model.state_dict())
             best_acc = 0.0
             best_macro_f1 = 0.0
-            for _ in range(params["epochs"]):
+            epoch_bar = tqdm(
+                range(params["epochs"]),
+                desc=f"[Task3][{name}][Fold {fold_idx}]",
+                leave=False,
+                unit="epoch",
+            )
+            for _ in epoch_bar:
                 _train_one_epoch(model, train_loader, criterion, optimizer, device)
                 _, val_acc, val_macro_f1 = _evaluate(model, val_loader, criterion, device)
                 if val_acc > best_acc:
@@ -457,7 +500,9 @@ def run_hparam_experiment(
                 }
             )
             del model
-            torch.cuda.empty_cache()
+            empty_device_cache()
+            fold_progress.update(1)
+        fold_progress.close()
         cv_rows.extend(fold_metrics)
         mean_val_acc = float(np.mean([row["val_accuracy"] for row in fold_metrics]))
         mean_val_macro_f1 = float(np.mean([row["val_macro_f1"] for row in fold_metrics]))
@@ -468,6 +513,7 @@ def run_hparam_experiment(
             baseline_transform,
             params,
             device,
+            progress_desc=f"[Task3][{name}] Test Fit",
         )
         test_loader = _build_dataloader(
             test_images,
@@ -501,7 +547,7 @@ def run_hparam_experiment(
         plot_labels.append(name)
         plot_values.append(test_metrics["accuracy"])
         del final_model
-        torch.cuda.empty_cache()
+        empty_device_cache()
 
     cv_df = pd.DataFrame(cv_rows)
     summary_df = pd.DataFrame(summary_rows)
