@@ -29,6 +29,10 @@ def _train_rf(
         n_estimators=params.get("n_estimators", 400),
         max_depth=params.get("max_depth"),
         min_samples_split=params.get("min_samples_split", 2),
+        min_samples_leaf=params.get("min_samples_leaf", 1),
+        max_features=params.get("max_features"),
+        max_samples=params.get("max_samples"),
+        class_weight=params.get("class_weight"),
         n_jobs=params.get("n_jobs", -1),
         random_state=random_state,
         bootstrap=True,
@@ -59,17 +63,22 @@ def _evaluate_test(
         n_estimators=params.get("n_estimators", 400),
         max_depth=params.get("max_depth"),
         min_samples_split=params.get("min_samples_split", 2),
+        min_samples_leaf=params.get("min_samples_leaf", 1),
+        max_features=params.get("max_features"),
+        max_samples=params.get("max_samples"),
+        class_weight=params.get("class_weight"),
         n_jobs=params.get("n_jobs", -1),
         random_state=random_state,
         bootstrap=True,
     )
     clf.fit(X_train, y_train)
     preds = clf.predict(X_test)
+    labels = sorted(np.unique(np.concatenate([y_train, y_test])))
     metrics = classification_metrics(
         y_test,
         preds,
-        class_names,
-        label_indices=list(range(len(class_names))),
+        class_names=[str(lbl) for lbl in labels],
+        label_indices=labels,
     )
     return clf, metrics
 

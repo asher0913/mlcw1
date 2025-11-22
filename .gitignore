@@ -5,3 +5,5 @@ outputs/
 src/mlcw/__pycache__/
 *.pyc
 outputs_rf/
+*.DS_Store
+.DS_Store

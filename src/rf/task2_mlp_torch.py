@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm.auto import tqdm
 
@@ -112,7 +112,7 @@ def _train_one_fold(
         dropout=params.dropout,
         num_classes=len(np.unique(y)),
         use_batchnorm=params.use_batchnorm,
-        use_gelu=not params.use_sgd,
+        use_gelu=params.use_gelu,
     ).to(device)
     if params.use_sgd:
         optimizer = torch.optim.SGD(
@@ -202,10 +202,20 @@ def _evaluate_test(
     progress_desc: str | None = None,
 ):
     seed_torch(seed)
+    # 创建内部验证集用于早停/调度（10%）
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=seed)
+    (train_idx, val_idx) = next(sss.split(X_train, y_train))
+
     train_loader = DataLoader(
-        TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)),
+        TensorDataset(torch.tensor(X_train[train_idx], dtype=torch.float32), torch.tensor(y_train[train_idx], dtype=torch.long)),
         batch_size=params.batch_size,
         shuffle=True,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        TensorDataset(torch.tensor(X_train[val_idx], dtype=torch.float32), torch.tensor(y_train[val_idx], dtype=torch.long)),
+        batch_size=params.batch_size,
+        shuffle=False,
         pin_memory=pin_memory,
     )
     test_loader = DataLoader(
@@ -214,6 +224,7 @@ def _evaluate_test(
         shuffle=False,
         pin_memory=pin_memory,
     )
+
     model = MLPClassifier(
         input_dim=X_train.shape[1],
         hidden_sizes=params.hidden_sizes,
@@ -230,7 +241,16 @@ def _evaluate_test(
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=params.lr, weight_decay=params.weight_decay
         )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=max(2, params.patience // 2),
+    )
 
+    best_state = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+    epochs_no_improve = 0
     epoch_bar = tqdm(
         range(params.epochs),
         desc=progress_desc or "MLP Full Train",
@@ -249,6 +269,30 @@ def _evaluate_test(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), params.max_grad_norm)
             optimizer.step()
 
+        # 验证集评估
+        model.eval()
+        all_preds: List[np.ndarray] = []
+        all_labels: List[np.ndarray] = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device, non_blocking=non_blocking), yb.to(device, non_blocking=non_blocking)
+                preds = model(xb).argmax(dim=1)
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(yb.cpu().numpy())
+        y_pred_val = np.concatenate(all_preds)
+        y_true_val = np.concatenate(all_labels)
+        val_acc = float(np.mean(y_pred_val == y_true_val))
+        scheduler.step(val_acc)
+        if val_acc > best_acc + 1e-4:
+            best_acc = val_acc
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= params.patience:
+                break
+
+    model.load_state_dict(best_state)
     model.eval()
     all_preds: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
@@ -298,7 +342,7 @@ def run_feature_dimension_experiment(
         patience=base_params.get("patience", 10),
         use_batchnorm=base_params.get("use_batchnorm", True),
         max_grad_norm=base_params.get("max_grad_norm", 1.0),
-        use_gelu=not base_params.get("use_sgd", False),
+        use_gelu=base_params.get("use_gelu", True),
         use_sgd=base_params.get("use_sgd", False),
     )
 

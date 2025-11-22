@@ -44,6 +44,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rf-estimators", type=int, default=400)
     parser.add_argument("--rf-max-depth", type=int, default=0, help="0 表示 None")
     parser.add_argument("--rf-min-split", type=int, default=2)
+    parser.add_argument("--rf-min-leaf", type=int, default=1)
+    parser.add_argument("--rf-max-features", type=str, default="auto", help="auto/sqrt/log2 or int/float")
+    parser.add_argument("--rf-max-samples", type=float, default=0.0, help="0 表示使用全部样本")
     parser.add_argument("--rf-n-jobs", type=int, default=-1)
     return parser.parse_args()
 
@@ -95,6 +98,9 @@ def main() -> None:
         "n_estimators": args.rf_estimators,
         "max_depth": None if args.rf_max_depth <= 0 else args.rf_max_depth,
         "min_samples_split": args.rf_min_split,
+        "min_samples_leaf": args.rf_min_leaf,
+        "max_features": None if args.rf_max_features == "auto" else args.rf_max_features,
+        "max_samples": None if args.rf_max_samples <= 0 else args.rf_max_samples,
         "n_jobs": args.rf_n_jobs,
     }
 
