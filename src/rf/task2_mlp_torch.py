@@ -1,4 +1,4 @@
-"""Task 2: GPU MLP experiments (feature sweep + hyper-parameter sweep)."""
+"""Task 2: GPU MLP experiments for the RF package."""
 
 from __future__ import annotations
 
@@ -30,15 +30,23 @@ def _require_gpu():
 
 
 class MLPClassifier(nn.Module):
-    """简单的多层感知机，用于处理 PCA 后的扁平特征。"""
-
-    def __init__(self, input_dim: int, hidden_sizes: Sequence[int], dropout: float, num_classes: int):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_sizes: Sequence[int],
+        dropout: float,
+        num_classes: int,
+        use_batchnorm: bool = True,
+        use_gelu: bool = True,
+    ):
         super().__init__()
         layers: List[nn.Module] = []
         last = input_dim
         for h in hidden_sizes:
             layers.append(nn.Linear(last, h))
-            layers.append(nn.ReLU(inplace=True))
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.GELU() if use_gelu else nn.ReLU(inplace=True))
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             last = h
@@ -58,6 +66,10 @@ class TrainParams:
     batch_size: int
     epochs: int
     patience: int
+    use_batchnorm: bool
+    max_grad_norm: float | None = None
+    use_gelu: bool = True
+    use_sgd: bool = False
 
 
 def _make_loaders(
@@ -99,9 +111,22 @@ def _train_one_fold(
         hidden_sizes=params.hidden_sizes,
         dropout=params.dropout,
         num_classes=len(np.unique(y)),
+        use_batchnorm=params.use_batchnorm,
+        use_gelu=not params.use_sgd,
     ).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=params.lr, weight_decay=params.weight_decay
+    if params.use_sgd:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=params.lr, momentum=0.9, weight_decay=params.weight_decay
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=params.lr, weight_decay=params.weight_decay
+        )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=max(2, params.patience // 3),
     )
     best_acc = 0.0
     best_f1 = 0.0
@@ -123,9 +148,10 @@ def _train_one_fold(
             logits = model(xb)
             loss = F.cross_entropy(logits, yb)
             loss.backward()
+            if params.max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), params.max_grad_norm)
             optimizer.step()
 
-        # 验证
         model.eval()
         all_preds: List[np.ndarray] = []
         all_labels: List[np.ndarray] = []
@@ -147,6 +173,7 @@ def _train_one_fold(
                 label_indices=class_labels,
             )["macro_f1"]
         )
+        scheduler.step(val_acc)
         if val_acc > best_acc + 1e-4:
             best_acc = val_acc
             best_f1 = val_f1
@@ -192,13 +219,18 @@ def _evaluate_test(
         hidden_sizes=params.hidden_sizes,
         dropout=params.dropout,
         num_classes=len(class_names),
+        use_batchnorm=params.use_batchnorm,
+        use_gelu=params.use_gelu,
     ).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=params.lr, weight_decay=params.weight_decay
-    )
-    best_state = copy.deepcopy(model.state_dict())
-    best_acc = 0.0
-    epochs_no_improve = 0
+    if params.use_sgd:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=params.lr, momentum=0.9, weight_decay=params.weight_decay
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=params.lr, weight_decay=params.weight_decay
+        )
+
     epoch_bar = tqdm(
         range(params.epochs),
         desc=progress_desc or "MLP Full Train",
@@ -213,29 +245,10 @@ def _evaluate_test(
             logits = model(xb)
             loss = F.cross_entropy(logits, yb)
             loss.backward()
+            if params.max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), params.max_grad_norm)
             optimizer.step()
-        # 简单早停：用训练集准确率跟踪
-        model.eval()
-        with torch.no_grad():
-            correct = 0
-            total = 0
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device, non_blocking=non_blocking), yb.to(device, non_blocking=non_blocking)
-                preds = model(xb).argmax(dim=1)
-                correct += (preds == yb).sum().item()
-                total += yb.size(0)
-            train_acc = correct / total
-        if train_acc > best_acc + 1e-4:
-            best_acc = train_acc
-            best_state = copy.deepcopy(model.state_dict())
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= params.patience:
-                break
 
-    model.load_state_dict(best_state)
-    # 测试集评估
     model.eval()
     all_preds: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
@@ -276,13 +289,17 @@ def run_feature_dimension_experiment(
     plot_points = []
 
     train_params = TrainParams(
-        hidden_sizes=tuple(base_params.get("hidden_layer_sizes", (512, 256))),
-        dropout=base_params.get("dropout", 0.1),
+        hidden_sizes=tuple(base_params.get("hidden_layer_sizes", (1024, 512))),
+        dropout=base_params.get("dropout", 0.3),
         lr=base_params.get("learning_rate", 1e-3),
         weight_decay=base_params.get("weight_decay", 1e-4),
         batch_size=base_params.get("batch_size", 256),
-        epochs=base_params.get("epochs", 60),
+        epochs=base_params.get("epochs", 80),
         patience=base_params.get("patience", 10),
+        use_batchnorm=base_params.get("use_batchnorm", True),
+        max_grad_norm=base_params.get("max_grad_norm", 1.0),
+        use_gelu=not base_params.get("use_sgd", False),
+        use_sgd=base_params.get("use_sgd", False),
     )
 
     feature_progress = tqdm(
@@ -406,13 +423,17 @@ def run_hparam_experiment(
     for idx, cfg in config_progress:
         name = cfg.get("name", f"cfg_{idx}")
         params = TrainParams(
-            hidden_sizes=cfg.get("hidden_layer_sizes", base_params.get("hidden_layer_sizes", (512, 256))),
-            dropout=cfg.get("dropout", base_params.get("dropout", 0.1)),
+            hidden_sizes=cfg.get("hidden_layer_sizes", base_params.get("hidden_layer_sizes", (1024, 512))),
+            dropout=cfg.get("dropout", base_params.get("dropout", 0.3)),
             lr=cfg.get("learning_rate", base_params.get("learning_rate", 1e-3)),
             weight_decay=cfg.get("weight_decay", base_params.get("weight_decay", 1e-4)),
             batch_size=cfg.get("batch_size", base_params.get("batch_size", 256)),
             epochs=cfg.get("epochs", base_params.get("epochs", 80)),
             patience=cfg.get("patience", base_params.get("patience", 10)),
+            use_batchnorm=cfg.get("use_batchnorm", base_params.get("use_batchnorm", True)),
+            max_grad_norm=cfg.get("max_grad_norm", base_params.get("max_grad_norm", 1.0)),
+            use_gelu=cfg.get("use_gelu", base_params.get("use_gelu", True)),
+            use_sgd=cfg.get("use_sgd", base_params.get("use_sgd", False)),
         )
         seed = random_state + idx * 131
         seed_torch(seed)

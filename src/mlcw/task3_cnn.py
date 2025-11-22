@@ -20,7 +20,13 @@ from tqdm.auto import tqdm
 
 from .metrics import classification_metrics
 from .plotting import plot_param_bar
-from .utils import ensure_dir, save_json, get_torch_device, seed_torch, empty_device_cache
+from .utils import (
+    ensure_dir,
+    save_json,
+    get_device_context,
+    seed_torch,
+    empty_device_cache,
+)
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
@@ -60,6 +66,7 @@ def _build_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    pin_memory: bool,
 ) -> DataLoader:
     dataset = NumpyCIFARDataset(images, labels, indices, transform)
     return DataLoader(
@@ -67,7 +74,7 @@ def _build_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
 
 
@@ -89,14 +96,15 @@ def _train_one_epoch(
     criterion,
     optimizer,
     device: torch.device,
+    non_blocking: bool,
 ) -> tuple[float, float]:
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=non_blocking)
+        targets = targets.to(device, non_blocking=non_blocking)
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, targets)
@@ -113,6 +121,7 @@ def _evaluate(
     loader: DataLoader,
     criterion,
     device: torch.device,
+    non_blocking: bool,
 ) -> tuple[float, float, float]:
     model.eval()
     running_loss = 0.0
@@ -121,8 +130,8 @@ def _evaluate(
     targets_all: List[np.ndarray] = []
     with torch.no_grad():
         for images, targets in loader:
-            images = images.to(device, non_blocking=True)
-            labels = targets.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=non_blocking)
+            labels = targets.to(device, non_blocking=non_blocking)
             outputs = model(images)
             loss = criterion(outputs, labels)
             running_loss += loss.item() * labels.size(0)
@@ -142,6 +151,8 @@ def _train_full_model(
     transform_train,
     params: Dict,
     device: torch.device,
+    non_blocking: bool,
+    pin_memory: bool,
     progress_desc: str | None = None,
 ) -> nn.Module:
     train_indices = np.arange(len(train_labels))
@@ -153,6 +164,7 @@ def _train_full_model(
         params["batch_size"],
         shuffle=True,
         num_workers=params["num_workers"],
+        pin_memory=pin_memory,
     )
     model = _build_model(num_classes=10, dropout=params.get("dropout", 0.0)).to(device)
     criterion = nn.CrossEntropyLoss()
@@ -170,16 +182,16 @@ def _train_full_model(
         unit="epoch",
     )
     for _ in epoch_bar:
-        _train_one_epoch(model, train_loader, criterion, optimizer, device)
+        _train_one_epoch(model, train_loader, criterion, optimizer, device, non_blocking=non_blocking)
         scheduler.step()
     return model
 
 
-def _require_gpu() -> torch.device:
-    device, backend = get_torch_device(require_gpu=True)
-    if backend == "cuda":
+def _require_gpu():
+    ctx = get_device_context(require_gpu=True)
+    if ctx.backend == "cuda":
         torch.backends.cudnn.benchmark = True
-    return device
+    return ctx
 
 
 def _feature_variants():
@@ -231,7 +243,8 @@ def run_feature_variant_experiment(
     cv_splits: int,
     random_state: int,
 ) -> pd.DataFrame:
-    device = _require_gpu()
+    ctx = _require_gpu()
+    device = ctx.device
     variant_dir = ensure_dir(output_dir / "task3" / "cnn_feature_sweep")
     reports_dir = ensure_dir(variant_dir / "reports")
     feature_variants = _feature_variants()
@@ -271,6 +284,7 @@ def run_feature_variant_experiment(
                 base_params["batch_size"],
                 shuffle=True,
                 num_workers=base_params["num_workers"],
+                pin_memory=ctx.pin_memory,
             )
             val_loader = _build_dataloader(
                 train_images,
@@ -280,6 +294,7 @@ def run_feature_variant_experiment(
                 base_params["batch_size"],
                 shuffle=False,
                 num_workers=base_params["num_workers"],
+                pin_memory=ctx.pin_memory,
             )
             model = _build_model(num_classes=len(class_names), dropout=base_params.get("dropout", 0.0)).to(device)
             criterion = nn.CrossEntropyLoss()
@@ -302,8 +317,21 @@ def run_feature_variant_experiment(
                 unit="epoch",
             )
             for _ in epoch_bar:
-                _train_one_epoch(model, train_loader, criterion, optimizer, device)
-                _, val_acc, val_macro_f1 = _evaluate(model, val_loader, criterion, device)
+                _train_one_epoch(
+                    model,
+                    train_loader,
+                    criterion,
+                    optimizer,
+                    device,
+                    non_blocking=ctx.non_blocking,
+                )
+                _, val_acc, val_macro_f1 = _evaluate(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    non_blocking=ctx.non_blocking,
+                )
                 if val_acc > best_acc:
                     best_acc = val_acc
                     best_macro_f1 = val_macro_f1
@@ -332,6 +360,8 @@ def run_feature_variant_experiment(
             transformer_train,
             base_params,
             device,
+            non_blocking=ctx.non_blocking,
+            pin_memory=ctx.pin_memory,
             progress_desc=f"[Task3][{variant['name']}] Test Fit",
         )
         test_loader = _build_dataloader(
@@ -342,10 +372,13 @@ def run_feature_variant_experiment(
             base_params["batch_size"],
             shuffle=False,
             num_workers=base_params["num_workers"],
+            pin_memory=ctx.pin_memory,
         )
         criterion = nn.CrossEntropyLoss()
-        test_loss, test_acc, _ = _evaluate(final_model, test_loader, criterion, device)
-        preds, truths = _collect_predictions(final_model, test_loader, device)
+        test_loss, test_acc, _ = _evaluate(
+            final_model, test_loader, criterion, device, non_blocking=ctx.non_blocking
+        )
+        preds, truths = _collect_predictions(final_model, test_loader, device, ctx.non_blocking)
         test_metrics = classification_metrics(truths, preds, class_names)
         metrics_json[variant["name"]] = test_metrics
         save_json(test_metrics, reports_dir / f"{variant['name']}_test_metrics.json")
@@ -385,14 +418,15 @@ def _collect_predictions(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    non_blocking: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     preds: List[np.ndarray] = []
     labels: List[np.ndarray] = []
     with torch.no_grad():
         for images, targets in loader:
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=non_blocking)
+            targets = targets.to(device, non_blocking=non_blocking)
             outputs = model(images)
             preds.append(outputs.argmax(dim=1).cpu().numpy())
             labels.append(targets.cpu().numpy())
@@ -411,7 +445,8 @@ def run_hparam_experiment(
     cv_splits: int,
     random_state: int,
 ) -> pd.DataFrame:
-    device = _require_gpu()
+    ctx = _require_gpu()
+    device = ctx.device
     sweep_dir = ensure_dir(output_dir / "task3" / "cnn_hparam_sweep")
     reports_dir = ensure_dir(sweep_dir / "reports")
     base_variants = _feature_variants()
@@ -453,6 +488,7 @@ def run_hparam_experiment(
                 params["batch_size"],
                 shuffle=True,
                 num_workers=params["num_workers"],
+                pin_memory=ctx.pin_memory,
             )
             val_loader = _build_dataloader(
                 train_images,
@@ -462,6 +498,7 @@ def run_hparam_experiment(
                 params["batch_size"],
                 shuffle=False,
                 num_workers=params["num_workers"],
+                pin_memory=ctx.pin_memory,
             )
             model = _build_model(
                 num_classes=len(class_names), dropout=params.get("dropout", 0.0)
@@ -484,8 +521,21 @@ def run_hparam_experiment(
                 unit="epoch",
             )
             for _ in epoch_bar:
-                _train_one_epoch(model, train_loader, criterion, optimizer, device)
-                _, val_acc, val_macro_f1 = _evaluate(model, val_loader, criterion, device)
+                _train_one_epoch(
+                    model,
+                    train_loader,
+                    criterion,
+                    optimizer,
+                    device,
+                    non_blocking=ctx.non_blocking,
+                )
+                _, val_acc, val_macro_f1 = _evaluate(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    non_blocking=ctx.non_blocking,
+                )
                 if val_acc > best_acc:
                     best_acc = val_acc
                     best_macro_f1 = val_macro_f1
@@ -513,6 +563,8 @@ def run_hparam_experiment(
             baseline_transform,
             params,
             device,
+            non_blocking=ctx.non_blocking,
+            pin_memory=ctx.pin_memory,
             progress_desc=f"[Task3][{name}] Test Fit",
         )
         test_loader = _build_dataloader(
@@ -523,10 +575,13 @@ def run_hparam_experiment(
             params["batch_size"],
             shuffle=False,
             num_workers=params["num_workers"],
+            pin_memory=ctx.pin_memory,
         )
         criterion = nn.CrossEntropyLoss()
-        test_loss, _, _ = _evaluate(final_model, test_loader, criterion, device)
-        preds, truths = _collect_predictions(final_model, test_loader, device)
+        test_loss, _, _ = _evaluate(
+            final_model, test_loader, criterion, device, non_blocking=ctx.non_blocking
+        )
+        preds, truths = _collect_predictions(final_model, test_loader, device, ctx.non_blocking)
         test_metrics = classification_metrics(truths, preds, class_names)
         metrics_json[name] = test_metrics
         save_json(test_metrics, reports_dir / f"{name}_test_metrics.json")
